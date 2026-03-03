@@ -1,20 +1,88 @@
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService = game:GetService("TweenService")
+-- PhoneAppsHandler.client.lua
+-- Phone UI navigation, app animations, and real-time player messaging system.
+-- Author: Drop  | HiddenDevs Luau Scripter Application
 
-local player = Players.LocalPlayer
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+
+local player    = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
-local phoneUI = playerGui:WaitForChild("PhoneUI")
-local phoneFrame = phoneUI:WaitForChild("PhoneFrame")
+local phoneUI     = playerGui:WaitForChild("PhoneUI")
+local phoneFrame  = phoneUI:WaitForChild("PhoneFrame")
 local innerScreen = phoneFrame:WaitForChild("InnerScreen")
-local appsArea = innerScreen:WaitForChild("AppsArea")
-local homeButton = phoneFrame:WaitForChild("HomeButton")
+local appsArea    = innerScreen:WaitForChild("AppsArea")
+local homeButton  = phoneFrame:WaitForChild("HomeButton")
+
+local chatRemote = ReplicatedStorage:FindFirstChild("ChatRemote")
+
+local appScreen    = innerScreen:WaitForChild("MessagesAppScreen")
+local contactsList = appScreen:WaitForChild("ContactsList")
+local chatScreen   = appScreen:WaitForChild("ChatScreen")
+local chatHeader   = chatScreen:WaitForChild("ChatHeader")
+local backBtn      = chatHeader:WaitForChild("BackButton")
+local contactName  = chatHeader:WaitForChild("ContactName")
+local messagesArea = chatScreen:WaitForChild("MessagesArea")
+local inputBar     = chatScreen:WaitForChild("InputBar")
+local inputBox     = inputBar:WaitForChild("InputBox")
+local sendBtn      = inputBar:WaitForChild("SendButton")
+
+-- ChatHistory: OOP metatable that stores per-contact message history
+local ChatHistory = {}
+ChatHistory.__index = ChatHistory
+
+function ChatHistory.new()
+	local self = setmetatable({}, ChatHistory)
+	self._data = {}
+	return self
+end
+
+function ChatHistory:push(contactName_, msg)
+	if not self._data[contactName_] then
+		self._data[contactName_] = {}
+	end
+	table.insert(self._data[contactName_], msg)
+end
+
+function ChatHistory:get(contactName_)
+	return self._data[contactName_] or {}
+end
+
+function ChatHistory:clear(contactName_)
+	self._data[contactName_] = nil
+end
+
+-- ContactRegistry: OOP metatable that maps player names to their UI buttons
+local ContactRegistry = {}
+ContactRegistry.__index = ContactRegistry
+
+function ContactRegistry.new()
+	local self = setmetatable({}, ContactRegistry)
+	self._buttons = {}
+	return self
+end
+
+function ContactRegistry:register(playerName, btn)
+	self._buttons[playerName] = btn
+end
+
+function ContactRegistry:get(playerName)
+	return self._buttons[playerName]
+end
+
+function ContactRegistry:reset()
+	self._buttons = {}
+end
+
+local history     = ChatHistory.new()
+local registry    = ContactRegistry.new()
+local currentChat = nil
 
 local function setAppsClickable(state)
 	for _, child in ipairs(appsArea:GetChildren()) do
 		if child:IsA("ImageButton") or child:IsA("TextButton") then
-			child.Active = state
+			child.Active          = state
 			child.AutoButtonColor = state
 		end
 	end
@@ -31,70 +99,61 @@ local function closeAllAppScreens()
 end
 
 homeButton.InputBegan:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+	local t = input.UserInputType
+	if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
 		closeAllAppScreens()
 	end
 end)
 
-local function playAppOpenAnimation(appScreen)
-	local overlay = appScreen:FindFirstChild("LoadingOverlay")
-	if not overlay then
-		return
-	end
+local function playAppOpenAnimation(appScreen_)
+	local overlay = appScreen_:FindFirstChild("LoadingOverlay")
+	if not overlay then return end
 
 	local logo = overlay:FindFirstChild("AppLogo")
-	if not logo or not logo:IsA("ImageLabel") then
-		return
-	end
+	if not logo or not logo:IsA("ImageLabel") then return end
 
-	overlay.Visible = true
+	overlay.Visible                = true
 	overlay.BackgroundTransparency = 0.4
-	logo.ImageTransparency = 1
-	logo.Size = UDim2.new(0, 0, 0, 0)
+	logo.ImageTransparency         = 1
+	logo.Size                      = UDim2.new(0, 0, 0, 0)
 
-	local tweenInfoIn = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-	local tweenInfoOut = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
-	local sizeGoal = UDim2.new(0, 80, 0, 80)
+	local tweenIn  = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	local tweenOut = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
 
-	local tweenLogoIn = TweenService:Create(logo, tweenInfoIn, {
-		Size = sizeGoal,
-		ImageTransparency = 0
+	-- Phase 1: logo grows and becomes opaque
+	local logoIn = TweenService:Create(logo, tweenIn, {
+		Size              = UDim2.new(0, 80, 0, 80),
+		ImageTransparency = 0,
 	})
-	tweenLogoIn:Play()
-	tweenLogoIn.Completed:Wait()
+	logoIn:Play()
+	logoIn.Completed:Wait()
 
 	task.wait(0.12)
 
-	local tweenOverlayOut = TweenService:Create(overlay, tweenInfoOut, {
-		BackgroundTransparency = 1
-	})
-	local tweenLogoOut = TweenService:Create(logo, tweenInfoOut, {
-		ImageTransparency = 1
-	})
+	-- Phase 2: overlay and logo fade out simultaneously
+	TweenService:Create(overlay, tweenOut, { BackgroundTransparency = 1 }):Play()
+	local logoOut = TweenService:Create(logo, tweenOut, { ImageTransparency = 1 })
+	logoOut:Play()
+	logoOut.Completed:Wait()
 
-	tweenOverlayOut:Play()
-	tweenLogoOut:Play()
-	tweenLogoOut.Completed:Wait()
 	overlay.Visible = false
 end
 
 for _, appIcon in ipairs(appsArea:GetChildren()) do
 	if (appIcon:IsA("ImageButton") or appIcon:IsA("TextButton")) and appIcon.Name:match("App") then
 		appIcon.MouseButton1Click:Connect(function()
-			local appScreenName = appIcon.Name .. "Screen"
-			local appScreen = innerScreen:FindFirstChild(appScreenName)
-			if not appScreen then
-				return
-			end
+			-- Convention: "FooApp" icon maps to "FooAppScreen"
+			local targetScreen = innerScreen:FindFirstChild(appIcon.Name .. "Screen")
+			if not targetScreen then return end
 
 			closeAllAppScreens()
-			appScreen.Visible = true
+			targetScreen.Visible = true
 			setAppsClickable(false)
 			appsArea.Visible = false
 
-			playAppOpenAnimation(appScreen)
+			playAppOpenAnimation(targetScreen)
 
-			local openedEvent = appScreen:FindFirstChild("OpenedEvent")
+			local openedEvent = targetScreen:FindFirstChild("OpenedEvent")
 			if openedEvent and openedEvent:IsA("BindableEvent") then
 				openedEvent:Fire()
 			end
@@ -102,188 +161,166 @@ for _, appIcon in ipairs(appsArea:GetChildren()) do
 	end
 end
 
-local chatRemote = ReplicatedStorage:FindFirstChild("ChatRemote")
-
-local msgAppIcon = appsArea:WaitForChild("MessagesApp")
-local appScreen = innerScreen:WaitForChild("MessagesAppScreen")
-local contactsList = appScreen:WaitForChild("ContactsList")
-local chatScreen = appScreen:WaitForChild("ChatScreen")
-local chatHeader = chatScreen:WaitForChild("ChatHeader")
-local backBtn = chatHeader:WaitForChild("BackButton")
-local contactName = chatHeader:WaitForChild("ContactName")
-local messagesArea = chatScreen:WaitForChild("MessagesArea")
-local inputBar = chatScreen:WaitForChild("InputBar")
-local inputBox = inputBar:WaitForChild("InputBox")
-local sendBtn = inputBar:WaitForChild("SendButton")
-
-local contactButtons = {}
-local currentChat = nil
-local chatHistory = {}
-
 local function setContactNotification(playerName, hasNotification)
-	local btn = contactButtons[playerName]
-	if not btn then
-		return
-	end
+	local btn = registry:get(playerName)
+	if not btn then return end
 
 	local badge = btn:FindFirstChild("NotifyBadge")
-	if hasNotification then
-		if not badge then
-			badge = Instance.new("Frame")
-			badge.Name = "NotifyBadge"
-			badge.Parent = btn
-			badge.Size = UDim2.new(0, 10, 0, 10)
-			badge.Position = UDim2.new(1, -18, 0, 10)
-			badge.BackgroundColor3 = Color3.fromRGB(255, 70, 70)
-			badge.BorderSizePixel = 0
-			badge.ZIndex = 60
 
-			local corner = Instance.new("UICorner")
-			corner.CornerRadius = UDim.new(1, 0)
-			corner.Parent = badge
-		end
-	else
-		if badge then
-			badge:Destroy()
-		end
+	if hasNotification and not badge then
+		badge                  = Instance.new("Frame")
+		badge.Name             = "NotifyBadge"
+		badge.Size             = UDim2.new(0, 10, 0, 10)
+		badge.Position         = UDim2.new(1, -18, 0, 10)
+		badge.BackgroundColor3 = Color3.fromRGB(255, 70, 70)
+		badge.BorderSizePixel  = 0
+		badge.ZIndex           = 60
+		badge.Parent           = btn
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(1, 0) -- radius 1 = perfect circle
+		corner.Parent = badge
+
+	elseif not hasNotification and badge then
+		badge:Destroy()
 	end
 end
 
 local function createMessageBubble(msg)
-	local isMe = msg.From == player.Name
+	local isMe = (msg.From == player.Name)
 
 	local wrapper = Instance.new("Frame")
-	wrapper.Parent = messagesArea
 	wrapper.BackgroundTransparency = 1
-	wrapper.Size = UDim2.new(1, 0, 0, 0)
+	wrapper.Size          = UDim2.new(1, 0, 0, 0)
 	wrapper.AutomaticSize = Enum.AutomaticSize.Y
-	wrapper.ZIndex = 61
+	wrapper.ZIndex        = 61
+	wrapper.Parent        = messagesArea
 
 	local bubble = Instance.new("Frame")
-	bubble.Parent = wrapper
-	bubble.Size = UDim2.new(0.7, 0, 0, 0)
+	bubble.Size             = UDim2.new(0.7, 0, 0, 0)
 	bubble.BackgroundColor3 = isMe and Color3.fromRGB(100, 150, 255) or Color3.fromRGB(28, 28, 30)
-	bubble.BorderSizePixel = 0
-	bubble.AutomaticSize = Enum.AutomaticSize.Y
-	bubble.ZIndex = 62
+	bubble.BorderSizePixel  = 0
+	bubble.AutomaticSize    = Enum.AutomaticSize.Y
+	bubble.ZIndex           = 62
+	-- AnchorPoint + Position aligns bubble left or right without absolute math
 	bubble.AnchorPoint = isMe and Vector2.new(1, 0) or Vector2.new(0, 0)
-	bubble.Position = isMe and UDim2.new(1, -10, 0, 0) or UDim2.new(0, 10, 0, 0)
+	bubble.Position    = isMe and UDim2.new(1, -10, 0, 0) or UDim2.new(0, 10, 0, 0)
+	bubble.Parent      = wrapper
 
 	local corner = Instance.new("UICorner")
 	corner.CornerRadius = UDim.new(0, 12)
 	corner.Parent = bubble
 
 	local padding = Instance.new("UIPadding")
-	padding.PaddingTop = UDim.new(0, 8)
+	padding.PaddingTop    = UDim.new(0, 8)
 	padding.PaddingBottom = UDim.new(0, 8)
-	padding.PaddingLeft = UDim.new(0, 12)
-	padding.PaddingRight = UDim.new(0, 12)
+	padding.PaddingLeft   = UDim.new(0, 12)
+	padding.PaddingRight  = UDim.new(0, 12)
 	padding.Parent = bubble
 
-	local textLabel = Instance.new("TextLabel")
-	textLabel.Parent = bubble
-	textLabel.Size = UDim2.new(1, -24, 0, 0)
-	textLabel.BackgroundTransparency = 1
-	textLabel.Font = Enum.Font.Gotham
-	textLabel.TextSize = 14
-	textLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-	textLabel.TextXAlignment = Enum.TextXAlignment.Left
-	textLabel.TextYAlignment = Enum.TextYAlignment.Top
-	textLabel.TextWrapped = true
-	textLabel.Text = msg.Text
-	textLabel.AutomaticSize = Enum.AutomaticSize.Y
-	textLabel.ZIndex = 63
+	local label = Instance.new("TextLabel")
+	label.Size                   = UDim2.new(1, -24, 0, 0)
+	label.BackgroundTransparency = 1
+	label.Font                   = Enum.Font.Gotham
+	label.TextSize               = 14
+	label.TextColor3             = Color3.fromRGB(255, 255, 255)
+	label.TextXAlignment         = Enum.TextXAlignment.Left
+	label.TextYAlignment         = Enum.TextYAlignment.Top
+	label.TextWrapped            = true
+	label.Text                   = msg.Text
+	label.AutomaticSize          = Enum.AutomaticSize.Y
+	label.ZIndex                 = 63
+	label.Parent                 = bubble
 end
 
 local function createContactButton(targetPlayer)
 	local btn = Instance.new("TextButton")
-	btn.Name = targetPlayer.Name
-	btn.Parent = contactsList
-	btn.Size = UDim2.new(1, 0, 0, 70)
+	btn.Name             = targetPlayer.Name
+	btn.Size             = UDim2.new(1, 0, 0, 70)
 	btn.BackgroundColor3 = Color3.fromRGB(28, 28, 30)
-	btn.BorderSizePixel = 0
-	btn.AutoButtonColor = false
-	btn.Text = ""
-	btn.ZIndex = 52
+	btn.BorderSizePixel  = 0
+	btn.AutoButtonColor  = false
+	btn.Text             = ""
+	btn.ZIndex           = 52
+	btn.Parent           = contactsList
 
 	local avatar = Instance.new("ImageLabel")
-	avatar.Parent = btn
-	avatar.Size = UDim2.new(0, 50, 0, 50)
-	avatar.Position = UDim2.new(0, 10, 0, 10)
+	avatar.Size             = UDim2.new(0, 50, 0, 50)
+	avatar.Position         = UDim2.new(0, 10, 0, 10)
 	avatar.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
-	avatar.ZIndex = 53
+	avatar.ZIndex           = 53
+	avatar.Parent           = btn
 
+	-- pcall guards against API failure on GetUserThumbnailAsync
 	local ok, img = pcall(function()
-		return Players:GetUserThumbnailAsync(targetPlayer.UserId, Enum.ThumbnailType.AvatarBust, Enum.ThumbnailSize.Size150x150)
+		return Players:GetUserThumbnailAsync(
+			targetPlayer.UserId,
+			Enum.ThumbnailType.AvatarBust,
+			Enum.ThumbnailSize.Size150x150
+		)
 	end)
-	if ok and img ~= "" then
-		avatar.Image = img
-	else
-		avatar.Image = "rbxassetid://11263217352"
-	end
+	avatar.Image = (ok and img ~= "") and img or "rbxassetid://11263217352"
 
 	local avatarCorner = Instance.new("UICorner")
 	avatarCorner.CornerRadius = UDim.new(1, 0)
 	avatarCorner.Parent = avatar
 
 	local nameLabel = Instance.new("TextLabel")
-	nameLabel.Parent = btn
-	nameLabel.Size = UDim2.new(1, -150, 0, 25)
-	nameLabel.Position = UDim2.new(0, 70, 0, 10)
+	nameLabel.Size                   = UDim2.new(1, -150, 0, 25)
+	nameLabel.Position               = UDim2.new(0, 70, 0, 10)
 	nameLabel.BackgroundTransparency = 1
-	nameLabel.Font = Enum.Font.GothamBold
-	nameLabel.TextSize = 16
-	nameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-	nameLabel.TextXAlignment = Enum.TextXAlignment.Left
-	nameLabel.Text = targetPlayer.DisplayName
-	nameLabel.ZIndex = 53
+	nameLabel.Font                   = Enum.Font.GothamBold
+	nameLabel.TextSize               = 16
+	nameLabel.TextColor3             = Color3.fromRGB(255, 255, 255)
+	nameLabel.TextXAlignment         = Enum.TextXAlignment.Left
+	nameLabel.Text                   = targetPlayer.DisplayName
+	nameLabel.ZIndex                 = 53
+	nameLabel.Parent                 = btn
 
 	local usernameLabel = Instance.new("TextLabel")
-	usernameLabel.Parent = btn
-	usernameLabel.Size = UDim2.new(1, -150, 0, 20)
-	usernameLabel.Position = UDim2.new(0, 70, 0, 35)
+	usernameLabel.Size                   = UDim2.new(1, -150, 0, 20)
+	usernameLabel.Position               = UDim2.new(0, 70, 0, 35)
 	usernameLabel.BackgroundTransparency = 1
-	usernameLabel.Font = Enum.Font.Gotham
-	usernameLabel.TextSize = 13
-	usernameLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
-	usernameLabel.TextXAlignment = Enum.TextXAlignment.Left
-	usernameLabel.Text = "@" .. targetPlayer.Name
-	usernameLabel.ZIndex = 53
+	usernameLabel.Font                   = Enum.Font.Gotham
+	usernameLabel.TextSize               = 13
+	usernameLabel.TextColor3             = Color3.fromRGB(150, 150, 150)
+	usernameLabel.TextXAlignment         = Enum.TextXAlignment.Left
+	usernameLabel.Text                   = "@" .. targetPlayer.Name
+	usernameLabel.ZIndex                 = 53
+	usernameLabel.Parent                 = btn
 
 	btn.MouseButton1Click:Connect(function()
-		currentChat = targetPlayer
+		currentChat      = targetPlayer
 		contactName.Text = targetPlayer.DisplayName
 
 		contactsList.Visible = false
-		chatScreen.Visible = true
+		chatScreen.Visible   = true
 
 		messagesArea:ClearAllChildren()
 		local layout = Instance.new("UIListLayout")
-		layout.Parent = messagesArea
-		layout.Padding = UDim.new(0, 8)
+		layout.Padding   = UDim.new(0, 8)
 		layout.SortOrder = Enum.SortOrder.LayoutOrder
+		layout.Parent    = messagesArea
 
 		setContactNotification(targetPlayer.Name, false)
 
-		local history = chatHistory[targetPlayer.Name]
-		if history then
-			for _, msg in ipairs(history) do
-				createMessageBubble(msg)
-			end
+		-- Re-render stored messages from ChatHistory metatable
+		for _, storedMsg in ipairs(history:get(targetPlayer.Name)) do
+			createMessageBubble(storedMsg)
 		end
 	end)
 
-	contactButtons[targetPlayer.Name] = btn
+	registry:register(targetPlayer.Name, btn)
 	return btn
 end
 
 local function refreshContacts()
 	contactsList:ClearAllChildren()
-	contactButtons = {}
+	registry:reset()
 
 	local layout = Instance.new("UIListLayout")
-	layout.Parent = contactsList
 	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent    = contactsList
 
 	for _, plr in ipairs(Players:GetPlayers()) do
 		if plr ~= player then
@@ -296,27 +333,20 @@ Players.PlayerAdded:Connect(refreshContacts)
 Players.PlayerRemoving:Connect(refreshContacts)
 
 sendBtn.MouseButton1Click:Connect(function()
-	if not chatRemote then
-		return
-	end
-	if not currentChat or inputBox.Text == "" then
-		return
-	end
+	if not chatRemote or not currentChat or inputBox.Text == "" then return end
 
-	local text = inputBox.Text
+	local text    = inputBox.Text
 	inputBox.Text = ""
 
 	chatRemote:FireServer("SendMessage", {
-		To = currentChat.Name,
+		To   = currentChat.Name,
 		Text = text,
 	})
 end)
 
 if chatRemote then
 	chatRemote.OnClientEvent:Connect(function(action, msg)
-		if action ~= "ReceiveMessage" then
-			return
-		end
+		if action ~= "ReceiveMessage" then return end
 
 		local otherName
 		if msg.From == player.Name then
@@ -327,34 +357,30 @@ if chatRemote then
 			return
 		end
 
-		chatHistory[otherName] = chatHistory[otherName] or {}
-		table.insert(chatHistory[otherName], msg)
+		-- Store via ChatHistory OOP interface
+		history:push(otherName, msg)
 
 		if currentChat and otherName == currentChat.Name then
 			createMessageBubble(msg)
-		else
-			if msg.To == player.Name then
-				setContactNotification(msg.From, true)
-			end
+		elseif msg.To == player.Name then
+			setContactNotification(msg.From, true)
 		end
 	end)
 end
 
 backBtn.MouseButton1Click:Connect(function()
-	chatScreen.Visible = false
+	chatScreen.Visible   = false
 	contactsList.Visible = true
-	currentChat = nil
+	currentChat          = nil
 end)
 
 local openedEvent = appScreen:FindFirstChild("OpenedEvent")
 if not openedEvent then
-	openedEvent = Instance.new("BindableEvent")
-	openedEvent.Name = "OpenedEvent"
+	openedEvent        = Instance.new("BindableEvent")
+	openedEvent.Name   = "OpenedEvent"
 	openedEvent.Parent = appScreen
 end
 
-openedEvent.Event:Connect(function()
-	refreshContacts()
-end)
+openedEvent.Event:Connect(refreshContacts)
 
 refreshContacts()
