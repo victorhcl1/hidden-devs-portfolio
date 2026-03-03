@@ -28,7 +28,7 @@ local inputBar     = chatScreen:WaitForChild("InputBar")
 local inputBox     = inputBar:WaitForChild("InputBox")
 local sendBtn      = inputBar:WaitForChild("SendButton")
 
--- ChatHistory: OOP metatable that stores per-contact message history
+
 local ChatHistory = {}
 ChatHistory.__index = ChatHistory
 
@@ -53,7 +53,6 @@ function ChatHistory:clear(contactName_)
 	self._data[contactName_] = nil
 end
 
--- ContactRegistry: OOP metatable that maps player names to their UI buttons
 local ContactRegistry = {}
 ContactRegistry.__index = ContactRegistry
 
@@ -120,7 +119,7 @@ local function playAppOpenAnimation(appScreen_)
 	local tweenIn  = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 	local tweenOut = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
 
-	-- Phase 1: logo grows and becomes opaque
+	
 	local logoIn = TweenService:Create(logo, tweenIn, {
 		Size              = UDim2.new(0, 80, 0, 80),
 		ImageTransparency = 0,
@@ -130,7 +129,7 @@ local function playAppOpenAnimation(appScreen_)
 
 	task.wait(0.12)
 
-	-- Phase 2: overlay and logo fade out simultaneously
+	
 	TweenService:Create(overlay, tweenOut, { BackgroundTransparency = 1 }):Play()
 	local logoOut = TweenService:Create(logo, tweenOut, { ImageTransparency = 1 })
 	logoOut:Play()
@@ -142,7 +141,7 @@ end
 for _, appIcon in ipairs(appsArea:GetChildren()) do
 	if (appIcon:IsA("ImageButton") or appIcon:IsA("TextButton")) and appIcon.Name:match("App") then
 		appIcon.MouseButton1Click:Connect(function()
-			-- Convention: "FooApp" icon maps to "FooAppScreen"
+				
 			local targetScreen = innerScreen:FindFirstChild(appIcon.Name .. "Screen")
 			if not targetScreen then return end
 
@@ -178,7 +177,7 @@ local function setContactNotification(playerName, hasNotification)
 		badge.Parent           = btn
 
 		local corner = Instance.new("UICorner")
-		corner.CornerRadius = UDim.new(1, 0) -- radius 1 = perfect circle
+		corner.CornerRadius = UDim.new(1, 0) 
 		corner.Parent = badge
 
 	elseif not hasNotification and badge then
@@ -202,7 +201,6 @@ local function createMessageBubble(msg)
 	bubble.BorderSizePixel  = 0
 	bubble.AutomaticSize    = Enum.AutomaticSize.Y
 	bubble.ZIndex           = 62
-	-- AnchorPoint + Position aligns bubble left or right without absolute math
 	bubble.AnchorPoint = isMe and Vector2.new(1, 0) or Vector2.new(0, 0)
 	bubble.Position    = isMe and UDim2.new(1, -10, 0, 0) or UDim2.new(0, 10, 0, 0)
 	bubble.Parent      = wrapper
@@ -251,7 +249,7 @@ local function createContactButton(targetPlayer)
 	avatar.ZIndex           = 53
 	avatar.Parent           = btn
 
-	-- pcall guards against API failure on GetUserThumbnailAsync
+
 	local ok, img = pcall(function()
 		return Players:GetUserThumbnailAsync(
 			targetPlayer.UserId,
@@ -304,7 +302,7 @@ local function createContactButton(targetPlayer)
 
 		setContactNotification(targetPlayer.Name, false)
 
-		-- Re-render stored messages from ChatHistory metatable
+
 		for _, storedMsg in ipairs(history:get(targetPlayer.Name)) do
 			createMessageBubble(storedMsg)
 		end
@@ -357,7 +355,7 @@ if chatRemote then
 			return
 		end
 
-		-- Store via ChatHistory OOP interface
+
 		history:push(otherName, msg)
 
 		if currentChat and otherName == currentChat.Name then
@@ -384,3 +382,4 @@ end
 openedEvent.Event:Connect(refreshContacts)
 
 refreshContacts()
+
