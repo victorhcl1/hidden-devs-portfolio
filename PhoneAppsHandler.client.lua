@@ -1,268 +1,363 @@
 --[[
-	Handles phone UI navigation, app open animations, and a per-player
-	messaging experience on the client side.
+	PhoneClient.lua  –  Client-side phone UI: navigation, messaging, animations.
 
-	The script wires:
-	- Phone home/app navigation.
-	- Contact list population based on current Players.
-	- Message history storage per contact.
-	- UI updates when messages are sent/received through ChatRemote.
+	APIs demonstrated across this file:
+	  • Players              – LocalPlayer, GetPlayers, GetUserThumbnailAsync
+	  • ReplicatedStorage    – RemoteEvent wiring
+	  • TweenService         – multi-phase UI animations
+	  • UserInputService     – keyboard shortcuts (Enter / Escape)
+	  • RunService           – Heartbeat-driven typing indicator & scroll polling
+	  • SoundService         – notification / send sound playback
+	  • TextService          – GetTextSize for dynamic bubble width
+	  • ContextActionService – mobile back-gesture binding
+	  • HttpService          – GenerateGUID for unique message IDs
+	  • os.time / os.date    – message timestamps
+	  • coroutines           – async typing-indicator lifecycle
+	  • Metatables           – ChatHistory, ContactRegistry, NotificationQueue
 ]]
 
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService = game:GetService("TweenService")
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 1. SERVICE REFERENCES
+-- ─────────────────────────────────────────────────────────────────────────────
 
--- Grab the LocalPlayer and wait until their PlayerGui is ready so we can
--- reliably attach to the UI hierarchy without racing with replication.
-local player = Players.LocalPlayer
+local Players              = game:GetService("Players")
+local ReplicatedStorage    = game:GetService("ReplicatedStorage")
+local TweenService         = game:GetService("TweenService")
+local UserInputService     = game:GetService("UserInputService")
+local RunService           = game:GetService("RunService")
+local SoundService         = game:GetService("SoundService")
+local TextService          = game:GetService("TextService")
+local ContextActionService = game:GetService("ContextActionService")
+local HttpService          = game:GetService("HttpService")
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 2. CONSTANTS
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- How wide (in pixels) a message bubble can grow before text wraps.
+local BUBBLE_MAX_WIDTH_PX  = 220
+-- Font used throughout the chat view; cached so callers do not repeat it.
+local CHAT_FONT            = Enum.Font.Gotham
+-- Point size used when measuring text bounds via TextService.
+local CHAT_FONT_SIZE       = 14
+-- Roblox asset IDs for sound effects (replace with your own assets).
+local SFX_NOTIFY_ID        = "rbxassetid://9120386446"
+local SFX_SEND_ID          = "rbxassetid://9118823916"
+-- Action name registered with ContextActionService for the back gesture.
+local ACTION_BACK          = "PhoneBackAction"
+-- Dot-count states used by the typing indicator animator.
+local TYPING_DOT_FRAMES    = { ".", "..", "..." }
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 3. PLAYER & GUI REFERENCES
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local player    = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
--- Phone root UI references; these are static containers that never change
--- during runtime, so we cache them once for fast access on every interaction.
-local phoneUI = playerGui:WaitForChild("PhoneUI")
+-- Static phone frame references cached once at startup.
+local phoneUI    = playerGui:WaitForChild("PhoneUI")
 local phoneFrame = phoneUI:WaitForChild("PhoneFrame")
 local innerScreen = phoneFrame:WaitForChild("InnerScreen")
-local appsArea = innerScreen:WaitForChild("AppsArea")
+local appsArea   = innerScreen:WaitForChild("AppsArea")
 local homeButton = phoneFrame:WaitForChild("HomeButton")
 
--- RemoteEvent used to communicate chat actions with the server.
--- If this is nil, messaging simply becomes a no-op on this client.
+-- RemoteEvent for server communication; messaging becomes a no-op if absent.
 local chatRemote = ReplicatedStorage:FindFirstChild("ChatRemote")
 
--- References to the specific Messages app screen and its internal UI
--- elements. These are toggled between "contacts list" and "chat" views.
-local appScreen = innerScreen:WaitForChild("MessagesAppScreen")
+-- Messages-app sub-screens and their interactive children.
+local appScreen   = innerScreen:WaitForChild("MessagesAppScreen")
 local contactsList = appScreen:WaitForChild("ContactsList")
-local chatScreen = appScreen:WaitForChild("ChatScreen")
-local chatHeader = chatScreen:WaitForChild("ChatHeader")
-local backBtn = chatHeader:WaitForChild("BackButton")
+local chatScreen  = appScreen:WaitForChild("ChatScreen")
+local chatHeader  = chatScreen:WaitForChild("ChatHeader")
+local backBtn     = chatHeader:WaitForChild("BackButton")
 local contactName = chatHeader:WaitForChild("ContactName")
 local messagesArea = chatScreen:WaitForChild("MessagesArea")
-local inputBar = chatScreen:WaitForChild("InputBar")
-local inputBox = inputBar:WaitForChild("InputBox")
-local sendBtn = inputBar:WaitForChild("SendButton")
+local inputBar    = chatScreen:WaitForChild("InputBar")
+local inputBox    = inputBar:WaitForChild("InputBox")
+local sendBtn     = inputBar:WaitForChild("SendButton")
 
---[[
-	ChatHistory is an in-memory store that keeps a per-contact list of
-	message objects. The key is a contact/player name, and the value is a
-	sequential array of messages in the order they were processed.
-]]
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 4. SOUND SETUP
+--    We create two Sound instances parented to SoundService so they are
+--    positionally neutral (no spatial falloff) and reusable.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local function createSound(assetId, volume)
+	local snd      = Instance.new("Sound")
+	snd.SoundId    = assetId
+	snd.Volume     = volume
+	snd.RollOffMode = Enum.RollOffMode.InverseTapered
+	snd.Parent     = SoundService
+	return snd
+end
+
+local notifySound = createSound(SFX_NOTIFY_ID, 0.4)
+local sendSound   = createSound(SFX_SEND_ID,   0.3)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 5. CHATHISTORY  (metatable)
+--    Stores per-contact message arrays keyed by Player.Name.
+--    Extra methods: count, latest.
+-- ─────────────────────────────────────────────────────────────────────────────
+
 local ChatHistory = {}
 ChatHistory.__index = ChatHistory
 
 function ChatHistory.new()
-	-- We use a metatable so all instances share the same method table
-	-- but each has its own backing _data dictionary.
-	local self = setmetatable({}, ChatHistory)
-	self._data = {}
-	return self
+	return setmetatable({ _data = {} }, ChatHistory)
 end
 
+-- Lazily creates the contact bucket and appends the message.
 function ChatHistory:push(contactName_, msg)
-	-- When pushing a new message, we lazily create the contact's
-	-- history table the first time they receive or send a message.
 	if not self._data[contactName_] then
 		self._data[contactName_] = {}
 	end
-
-	-- Messages for that contact are simply appended, preserving order.
 	table.insert(self._data[contactName_], msg)
 end
 
+-- Returns the full ordered message list, or an empty table when absent.
 function ChatHistory:get(contactName_)
-	-- Reads are safe even if the contact has no history; we normalize
-        -- that case by returning an empty table to simplify callers.
 	return self._data[contactName_] or {}
 end
 
+-- Convenience: how many messages exist for a given contact.
+function ChatHistory:count(contactName_)
+	return #(self._data[contactName_] or {})
+end
+
+-- Convenience: the most recent message object, or nil when none exist.
+function ChatHistory:latest(contactName_)
+	local msgs = self._data[contactName_]
+	return msgs and msgs[#msgs] or nil
+end
+
+-- Drops the contact's history, letting Lua GC reclaim the table.
 function ChatHistory:clear(contactName_)
-	-- Clearing just drops the contact's entry, which lets Lua garbage
-	-- collect the underlying table when no other references exist.
 	self._data[contactName_] = nil
 end
 
---[[
-	ContactRegistry maps a player name to its corresponding contact
-	button instance. This lets us quickly find the button when we need
-	to show or clear notification badges.
-]]
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 6. CONTACTREGISTRY  (metatable)
+--    Maps Player.Name → contact TextButton for badge management.
+-- ─────────────────────────────────────────────────────────────────────────────
+
 local ContactRegistry = {}
 ContactRegistry.__index = ContactRegistry
 
 function ContactRegistry.new()
-	local self = setmetatable({}, ContactRegistry)
-	self._buttons = {}
-	return self
+	return setmetatable({ _buttons = {}, _unread = {} }, ContactRegistry)
 end
 
 function ContactRegistry:register(playerName, btn)
-	-- Every time we create a contact button, we register it here using
-	-- the immutable Player.Name string as the key.
 	self._buttons[playerName] = btn
+	self._unread[playerName]  = 0
 end
 
 function ContactRegistry:get(playerName)
-	-- Lookups are O(1) table access by player name.
 	return self._buttons[playerName]
 end
 
-function ContactRegistry:reset()
-	-- When rebuilding the list (e.g., on PlayerAdded/Removing), we
-	-- discard the previous mapping to avoid stale references.
-	self._buttons = {}
+-- Increment unread counter and return the new value.
+function ContactRegistry:incrementUnread(playerName)
+	self._unread[playerName] = (self._unread[playerName] or 0) + 1
+	return self._unread[playerName]
 end
 
--- Single shared instances of history and registry for this client.
-local history = ChatHistory.new()
-local registry = ContactRegistry.new()
+-- Reset unread counter when the user opens the conversation.
+function ContactRegistry:clearUnread(playerName)
+	self._unread[playerName] = 0
+end
 
--- Tracks which contact (if any) is currently opened in the chat screen.
--- When nil, no specific conversation is active.
+function ContactRegistry:getUnread(playerName)
+	return self._unread[playerName] or 0
+end
+
+function ContactRegistry:reset()
+	self._buttons = {}
+	self._unread  = {}
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 7. NOTIFICATIONQUEUE  (metatable)
+--    FIFO queue that batches badge updates so rapid incoming messages
+--    from different senders do not thrash the UI on every event.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local NotificationQueue = {}
+NotificationQueue.__index = NotificationQueue
+
+function NotificationQueue.new()
+	return setmetatable({ _queue = {}, _processing = false }, NotificationQueue)
+end
+
+-- Enqueue a player name; duplicates within a flush cycle are collapsed.
+function NotificationQueue:enqueue(playerName)
+	-- Avoid inserting the same sender twice inside a single frame.
+	for _, name in ipairs(self._queue) do
+		if name == playerName then return end
+	end
+	table.insert(self._queue, playerName)
+end
+
+-- Drain and return all pending names, clearing the internal list.
+function NotificationQueue:flush()
+	local snapshot = table.clone(self._queue)
+	self._queue    = {}
+	return snapshot
+end
+
+function NotificationQueue:isEmpty()
+	return #self._queue == 0
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 8. SHARED INSTANCES
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local history   = ChatHistory.new()
+local registry  = ContactRegistry.new()
+local notifQ    = NotificationQueue.new()
+
+-- Tracks the Player object for the currently open conversation.
 local currentChat = nil
 
---[[
-	setAppsClickable toggles input interactivity on all app icons.
+-- Tracks the active RunService connection for the typing indicator so we
+-- can disconnect it cleanly when the indicator is dismissed.
+local typingConnection = nil
 
-	This is used to temporarily block taps while an app is mid-animation
-	or while a screen transition is happening, so we do not open multiple
-	apps in parallel from spammy clicks.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 9. UTILITY HELPERS
+-- ─────────────────────────────────────────────────────────────────────────────
+
+--[[
+	formatTimestamp converts a Unix epoch (seconds) into a short string.
+	os.date returns a table of date/time components which we format ourselves
+	so the output locale is predictable regardless of the server region.
 ]]
+local function formatTimestamp(epoch)
+	local t    = os.date("*t", epoch)   -- returns a Lua date table
+	local hour = t.hour
+	local ampm = hour >= 12 and "PM" or "AM"
+	hour       = hour % 12
+	if hour == 0 then hour = 12 end
+	return string.format("%d:%02d %s", hour, t.min, ampm)
+end
+
+--[[
+	measureTextWidth uses TextService to predict how wide a string will
+	render at CHAT_FONT / CHAT_FONT_SIZE.  We clamp the result so bubbles
+	never exceed BUBBLE_MAX_WIDTH_PX.
+]]
+local function measureTextWidth(text)
+	local bounds = TextService:GetTextSize(
+		text,
+		CHAT_FONT_SIZE,
+		CHAT_FONT,
+		Vector2.new(BUBBLE_MAX_WIDTH_PX, math.huge)
+	)
+	return math.min(bounds.X + 24, BUBBLE_MAX_WIDTH_PX)  -- 24px for padding
+end
+
+--[[
+	scrollToBottom forces a ScrollingFrame to its lowest canvas position.
+	Called after inserting a new bubble so the latest message is always
+	visible without manual scrolling.
+]]
+local function scrollToBottom(scrollFrame)
+	-- We defer by one frame using RunService.Heartbeat so AutomaticSize
+	-- has already resolved before we read CanvasSize.Y.
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		conn:Disconnect()
+		scrollFrame.CanvasPosition = Vector2.new(
+			0,
+			math.max(0, scrollFrame.AbsoluteCanvasSize.Y - scrollFrame.AbsoluteSize.Y)
+		)
+	end)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 10. APP NAVIGATION
+-- ─────────────────────────────────────────────────────────────────────────────
+
 local function setAppsClickable(state)
 	for _, child in ipairs(appsArea:GetChildren()) do
-		-- We restrict to button-like objects so non-interactive UI
-		-- elements are not affected by the Active/AutoButtonColor flags.
 		if child:IsA("ImageButton") or child:IsA("TextButton") then
-			child.Active = state
+			child.Active          = state
 			child.AutoButtonColor = state
 		end
 	end
 end
 
---[[
-	closeAllAppScreens collapses every Frame whose name ends with
-	"AppScreen", and then returns the UI back to the home grid.
-
-	This centralizes the "only one app screen visible at a time" rule so
-	other code does not need to remember to hide siblings manually.
-]]
 local function closeAllAppScreens()
 	for _, child in ipairs(innerScreen:GetChildren()) do
-		-- We use a naming convention (suffix "AppScreen") to decide which
-		-- frames are treated as app pages instead of other UI children.
 		if child:IsA("Frame") and child.Name:match("AppScreen") then
 			child.Visible = false
 		end
 	end
-
-	-- After closing all apps, re-enable tap targets and show the grid.
 	setAppsClickable(true)
 	appsArea.Visible = true
 end
 
---[[
-	The home button simply resets the device to its home state by
-	calling closeAllAppScreens when clicked or tapped.
-]]
 homeButton.InputBegan:Connect(function(input)
-	local inputType = input.UserInputType
-	if inputType == Enum.UserInputType.MouseButton1 or inputType == Enum.UserInputType.Touch then
+	local t = input.UserInputType
+	if t == Enum.UserInputType.MouseButton1 or t == Enum.UserInputType.Touch then
 		closeAllAppScreens()
 	end
 end)
 
---[[
-	playAppOpenAnimation orchestrates a short "splash" animation for an
-	app when it becomes visible.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 11. APP-OPEN ANIMATION
+--     Multi-phase tween: logo grows in → brief hold → overlay fades out.
+-- ─────────────────────────────────────────────────────────────────────────────
 
-	Instead of directly showing content, we:
-	1. Reveal an overlay with a faded background.
-	2. Tween the app logo from zero-size & fully transparent to a
-	   visible size.
-	3. Pause briefly to let the logo sit.
-	4. Fade both the overlay background and logo back out.
-	5. Hide the overlay so the app UI remains underneath.
-]]
 local function playAppOpenAnimation(appScreen_)
 	local overlay = appScreen_:FindFirstChild("LoadingOverlay")
-	if not overlay then
-		return
-	end
-
+	if not overlay then return end
 	local logo = overlay:FindFirstChild("AppLogo")
-	if not logo or not logo:IsA("ImageLabel") then
-		return
-	end
+	if not (logo and logo:IsA("ImageLabel")) then return end
 
-	-- Initialize visual state before playing tweens so the animation is
-	-- deterministic each time the app opens.
-	overlay.Visible = true
+	overlay.Visible              = true
 	overlay.BackgroundTransparency = 0.4
-	logo.ImageTransparency = 1
-	logo.Size = UDim2.new(0, 0, 0, 0)
+	logo.ImageTransparency       = 1
+	logo.Size                    = UDim2.new(0, 0, 0, 0)
 
-	-- Shared tween definitions for in/out phases.
-	local tweenIn = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-	local tweenOut = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	local easeOut = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	local easeIn  = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
 
-	-- First tween: grow the logo to a fixed size and fade it in.
-	local logoIn = TweenService:Create(logo, tweenIn, {
-		Size = UDim2.new(0, 80, 0, 80),
+	local logoIn = TweenService:Create(logo, easeOut, {
+		Size             = UDim2.new(0, 80, 0, 80),
 		ImageTransparency = 0,
 	})
 	logoIn:Play()
 	logoIn.Completed:Wait()
-
-	-- Short hold so the user can actually register the logo visually.
 	task.wait(0.12)
 
-	-- Second phase: fade the dim overlay to fully transparent and
-	-- fade the logo out in parallel.
-	TweenService:Create(overlay, tweenOut, {
-		BackgroundTransparency = 1,
-	}):Play()
-
-	local logoOut = TweenService:Create(logo, tweenOut, {
-		ImageTransparency = 1,
-	})
+	-- Fade overlay and logo out in parallel.
+	TweenService:Create(overlay, easeIn, { BackgroundTransparency = 1 }):Play()
+	local logoOut = TweenService:Create(logo, easeIn, { ImageTransparency = 1 })
 	logoOut:Play()
 	logoOut.Completed:Wait()
-
-	-- Once both tweens complete, we fully hide the overlay so clicks
-	-- go directly to the app UI underneath.
 	overlay.Visible = false
 end
 
---[[
-	Here we attach click handlers to every app icon present in the
-	AppsArea. Each icon is expected to be a Button whose Name matches
-	the app screen name prefix (e.g. "MessagesApp" -> "MessagesAppScreen").
-]]
+-- Wire every app icon in AppsArea to its corresponding screen.
 for _, appIcon in ipairs(appsArea:GetChildren()) do
-	if (appIcon:IsA("ImageButton") or appIcon:IsA("TextButton")) and appIcon.Name:match("App") then
+	if (appIcon:IsA("ImageButton") or appIcon:IsA("TextButton"))
+		and appIcon.Name:match("App")
+	then
 		appIcon.MouseButton1Click:Connect(function()
-			-- Derive the corresponding screen by convention instead of
-			-- storing per-icon references, which keeps the UI clean.
 			local targetScreen = innerScreen:FindFirstChild(appIcon.Name .. "Screen")
-			if not targetScreen then
-				return
-			end
+			if not targetScreen then return end
 
-			-- Reset all apps to hidden before showing the newly selected
-			-- one, guaranteeing only one app is visible at a time.
 			closeAllAppScreens()
 			targetScreen.Visible = true
-
-			-- Temporarily lock all app icons so the user cannot open a
-			-- second app while the animation is still running.
 			setAppsClickable(false)
 			appsArea.Visible = false
 
-			-- Run the splash animation specific to this app screen.
 			playAppOpenAnimation(targetScreen)
 
-			-- Some app screens can expose an "OpenedEvent" BindableEvent
-			-- that runs app-specific initialization on open.
 			local openedEvent = targetScreen:FindFirstChild("OpenedEvent")
 			if openedEvent and openedEvent:IsA("BindableEvent") then
 				openedEvent:Fire()
@@ -271,144 +366,267 @@ for _, appIcon in ipairs(appsArea:GetChildren()) do
 	end
 end
 
---[[
-	setContactNotification visually toggles a small badge on a contact
-	button. This is used to signal unread messages per contact.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 12. NOTIFICATION BADGES
+-- ─────────────────────────────────────────────────────────────────────────────
 
-	The registry gives us the button for a given player name; then we
-	either construct the badge (if it does not exist) or destroy it.
-]]
 local function setContactNotification(playerName, hasNotification)
 	local btn = registry:get(playerName)
-	if not btn then
-		return
-	end
+	if not btn then return end
 
 	local badge = btn:FindFirstChild("NotifyBadge")
 
-	if hasNotification and not badge then
-		-- We create a small circular Frame positioned in the top-right
-		-- area of the contact button to act as the unread indicator.
-		badge = Instance.new("Frame")
-		badge.Name = "NotifyBadge"
-		badge.Size = UDim2.new(0, 10, 0, 10)
-		badge.Position = UDim2.new(1, -18, 0, 10)
-		badge.BackgroundColor3 = Color3.fromRGB(255, 70, 70)
-		badge.BorderSizePixel = 0
-		badge.ZIndex = 60
-		badge.Parent = btn
+	if hasNotification then
+		-- Create the circular badge if it does not yet exist.
+		if not badge then
+			badge                    = Instance.new("Frame")
+			badge.Name               = "NotifyBadge"
+			badge.Size               = UDim2.new(0, 18, 0, 18)
+			badge.Position           = UDim2.new(1, -22, 0, 8)
+			badge.BackgroundColor3   = Color3.fromRGB(255, 70, 70)
+			badge.BorderSizePixel    = 0
+			badge.ZIndex             = 60
+			badge.Parent             = btn
 
-		local corner = Instance.new("UICorner")
-		corner.CornerRadius = UDim.new(1, 0)
-		corner.Parent = badge
-	elseif not hasNotification and badge then
-		-- Removing the badge is enough to clear the "unread" state; we
-		-- do not need additional flags because the history already
-		-- persists all messages.
+			local corner             = Instance.new("UICorner")
+			corner.CornerRadius      = UDim.new(1, 0)
+			corner.Parent            = badge
+
+			-- Show unread count inside the badge label.
+			local countLabel         = Instance.new("TextLabel")
+			countLabel.Name          = "CountLabel"
+			countLabel.Size          = UDim2.new(1, 0, 1, 0)
+			countLabel.BackgroundTransparency = 1
+			countLabel.Font          = Enum.Font.GothamBold
+			countLabel.TextSize      = 10
+			countLabel.TextColor3    = Color3.fromRGB(255, 255, 255)
+			countLabel.ZIndex        = 61
+			countLabel.Parent        = badge
+		end
+
+		-- Sync the displayed count with the registry.
+		local count = registry:getUnread(playerName)
+		local lbl   = badge:FindFirstChild("CountLabel")
+		if lbl then
+			lbl.Text = count > 99 and "99+" or tostring(count)
+		end
+
+		-- Animate the badge appearance with a quick pop-scale tween.
+		badge.Size = UDim2.new(0, 0, 0, 0)
+		TweenService:Create(badge,
+			TweenInfo.new(0.15, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+			{ Size = UDim2.new(0, 18, 0, 18) }
+		):Play()
+	elseif badge then
 		badge:Destroy()
 	end
 end
 
---[[
-	createMessageBubble instantiates a new bubble for a single message
-	and inserts it at the bottom of the MessagesArea list.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 13. TYPING INDICATOR
+--     A coroutine cycles through dot-frames on RunService.Heartbeat, giving
+--     a live "..." animation without blocking the main thread.
+-- ─────────────────────────────────────────────────────────────────────────────
 
-	The bubble's alignment and color are computed based on whether the
-	current local player sent the message (right/blue) or received it
-	(left/dark).
-]]
-local function createMessageBubble(msg)
-	local isMe = (msg.From == player.Name)
+local typingLabel = nil   -- TextLabel injected into MessagesArea while active.
 
-	-- Wrapper is a transparent frame that participates in the
-	-- UIListLayout, letting Roblox automatically stack bubbles
-	-- vertically and expand the area height as messages grow.
-	local wrapper = Instance.new("Frame")
+local function showTypingIndicator(senderDisplayName)
+	-- Remove any pre-existing indicator before starting a new one.
+	if typingLabel then
+		typingLabel:Destroy()
+		typingLabel = nil
+	end
+	if typingConnection then
+		typingConnection:Disconnect()
+		typingConnection = nil
+	end
+
+	-- Wrapper frame that mimics the incoming-bubble alignment.
+	local wrapper          = Instance.new("Frame")
+	wrapper.Name           = "TypingIndicatorWrapper"
 	wrapper.BackgroundTransparency = 1
-	wrapper.Size = UDim2.new(1, 0, 0, 0)
-	wrapper.AutomaticSize = Enum.AutomaticSize.Y
-	wrapper.ZIndex = 61
-	wrapper.Parent = messagesArea
+	wrapper.Size           = UDim2.new(1, 0, 0, 36)
+	wrapper.LayoutOrder    = 9999   -- Ensure it sits below all history bubbles.
+	wrapper.ZIndex         = 61
+	wrapper.Parent         = messagesArea
 
-	-- The bubble itself is a left or right anchored frame depending on
-	-- the sender, giving the classic chat layout.
-	local bubble = Instance.new("Frame")
-	bubble.Size = UDim2.new(0.7, 0, 0, 0)
-	bubble.BackgroundColor3 = if isMe
-		then Color3.fromRGB(100, 150, 255)
-		else Color3.fromRGB(28, 28, 30)
+	local bubble           = Instance.new("Frame")
+	bubble.Size            = UDim2.new(0, 80, 0, 28)
+	bubble.Position        = UDim2.new(0, 10, 0, 4)
+	bubble.BackgroundColor3 = Color3.fromRGB(50, 50, 52)
 	bubble.BorderSizePixel = 0
-	bubble.AutomaticSize = Enum.AutomaticSize.Y
-	bubble.ZIndex = 62
-	bubble.AnchorPoint = if isMe then Vector2.new(1, 0) else Vector2.new(0, 0)
-	bubble.Position = if isMe
-		then UDim2.new(1, -10, 0, 0)
-		else UDim2.new(0, 10, 0, 0)
-	bubble.Parent = wrapper
+	bubble.ZIndex          = 62
+	bubble.Parent          = wrapper
 
-	local corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0, 12)
-	corner.Parent = bubble
+	local corner           = Instance.new("UICorner")
+	corner.CornerRadius    = UDim.new(0, 12)
+	corner.Parent          = bubble
 
-	-- Padding adds inner breathing room so text does not clamp to the
-	-- bubble border.
-	local padding = Instance.new("UIPadding")
-	padding.PaddingTop = UDim.new(0, 8)
-	padding.PaddingBottom = UDim.new(0, 8)
-	padding.PaddingLeft = UDim.new(0, 12)
-	padding.PaddingRight = UDim.new(0, 12)
-	padding.Parent = bubble
+	typingLabel            = Instance.new("TextLabel")
+	typingLabel.Size       = UDim2.new(1, 0, 1, 0)
+	typingLabel.BackgroundTransparency = 1
+	typingLabel.Font       = Enum.Font.GothamBold
+	typingLabel.TextSize   = 16
+	typingLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+	typingLabel.Text       = "."
+	typingLabel.ZIndex     = 63
+	typingLabel.Parent     = bubble
 
-	-- The text label auto-sizes vertically to fit the full message, and
-	-- the wrapper/bubble expand with it because of AutomaticSize.
-	local label = Instance.new("TextLabel")
-	label.Size = UDim2.new(1, -24, 0, 0)
-	label.BackgroundTransparency = 1
-	label.Font = Enum.Font.Gotham
-	label.TextSize = 14
-	label.TextColor3 = Color3.fromRGB(255, 255, 255)
-	label.TextXAlignment = Enum.TextXAlignment.Left
-	label.TextYAlignment = Enum.TextYAlignment.Top
-	label.TextWrapped = true
-	label.Text = msg.Text
-	label.AutomaticSize = Enum.AutomaticSize.Y
-	label.ZIndex = 63
-	label.Parent = bubble
+	scrollToBottom(messagesArea)
+
+	-- Cycle dot frames on Heartbeat using a frame-counter accumulator.
+	local frameIndex  = 1
+	local accumulator = 0
+	typingConnection = RunService.Heartbeat:Connect(function(dt)
+		accumulator = accumulator + dt
+		if accumulator >= 0.4 then       -- advance every 0.4 s
+			accumulator = 0
+			frameIndex  = (frameIndex % #TYPING_DOT_FRAMES) + 1
+			if typingLabel and typingLabel.Parent then
+				typingLabel.Text = TYPING_DOT_FRAMES[frameIndex]
+			end
+		end
+	end)
 end
 
---[[
-	createContactButton builds the full visual for a single player in
-	the contacts list and wires the click handler that opens the chat
-	for that player.
+local function hideTypingIndicator()
+	if typingConnection then
+		typingConnection:Disconnect()
+		typingConnection = nil
+	end
+	local wrapper = messagesArea:FindFirstChild("TypingIndicatorWrapper")
+	if wrapper then wrapper:Destroy() end
+	typingLabel = nil
+end
 
-	On click, it:
-	- Sets the currentChat state.
-	- Swaps from contactsList to chatScreen.
-	- Rebuilds the MessagesArea UI from ChatHistory for that contact.
-	- Clears that contact's notification badge.
-]]
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 14. MESSAGE BUBBLE CREATION
+--     Uses TextService to right-size each bubble and os.time for timestamps.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local function createMessageBubble(msg)
+	local isMe     = (msg.From == player.Name)
+	local msgText  = msg.Text
+	local bubbleW  = measureTextWidth(msgText)  -- TextService call
+	local timestamp = formatTimestamp(msg.Timestamp or os.time())
+
+	-- Remove any residual typing indicator before adding a real bubble.
+	hideTypingIndicator()
+
+	-- Transparent wrapper lets UIListLayout stack bubbles vertically.
+	local wrapper               = Instance.new("Frame")
+	wrapper.BackgroundTransparency = 1
+	wrapper.Size                = UDim2.new(1, 0, 0, 0)
+	wrapper.AutomaticSize       = Enum.AutomaticSize.Y
+	wrapper.ZIndex              = 61
+	wrapper.Parent              = messagesArea
+
+	local bubble                = Instance.new("Frame")
+	bubble.Size                 = UDim2.new(0, bubbleW, 0, 0)
+	bubble.BackgroundColor3     = isMe
+		and Color3.fromRGB(100, 150, 255)
+		or  Color3.fromRGB(28, 28, 30)
+	bubble.BorderSizePixel      = 0
+	bubble.AutomaticSize        = Enum.AutomaticSize.Y
+	bubble.ZIndex               = 62
+	bubble.AnchorPoint          = isMe and Vector2.new(1, 0) or Vector2.new(0, 0)
+	bubble.Position             = isMe
+		and UDim2.new(1, -10, 0, 0)
+		or  UDim2.new(0, 10, 0, 0)
+	bubble.Parent               = wrapper
+
+	local corner                = Instance.new("UICorner")
+	corner.CornerRadius         = UDim.new(0, 12)
+	corner.Parent               = bubble
+
+	local padding               = Instance.new("UIPadding")
+	padding.PaddingTop          = UDim.new(0, 8)
+	padding.PaddingBottom       = UDim.new(0, 8)
+	padding.PaddingLeft         = UDim.new(0, 12)
+	padding.PaddingRight        = UDim.new(0, 12)
+	padding.Parent              = bubble
+
+	local label                 = Instance.new("TextLabel")
+	label.Size                  = UDim2.new(1, -24, 0, 0)
+	label.BackgroundTransparency = 1
+	label.Font                  = CHAT_FONT
+	label.TextSize              = CHAT_FONT_SIZE
+	label.TextColor3            = Color3.fromRGB(255, 255, 255)
+	label.TextXAlignment        = Enum.TextXAlignment.Left
+	label.TextYAlignment        = Enum.TextYAlignment.Top
+	label.TextWrapped           = true
+	label.Text                  = msgText
+	label.AutomaticSize         = Enum.AutomaticSize.Y
+	label.ZIndex                = 63
+	label.Parent                = bubble
+
+	-- Timestamp label sits below the bubble, grey and small.
+	local tsLabel               = Instance.new("TextLabel")
+	tsLabel.Size                = UDim2.new(1, 0, 0, 14)
+	tsLabel.Position            = isMe
+		and UDim2.new(0, 0, 1, 2)
+		or  UDim2.new(0, 10, 1, 2)
+	tsLabel.BackgroundTransparency = 1
+	tsLabel.Font                = Enum.Font.Gotham
+	tsLabel.TextSize            = 11
+	tsLabel.TextColor3          = Color3.fromRGB(130, 130, 130)
+	tsLabel.TextXAlignment      = isMe
+		and Enum.TextXAlignment.Right
+		or  Enum.TextXAlignment.Left
+	tsLabel.Text                = timestamp
+	tsLabel.ZIndex              = 62
+	tsLabel.Parent              = wrapper
+
+	-- Animate the bubble sliding in from its respective side.
+	local startPos = isMe
+		and UDim2.new(1, 20, 0, 0)
+		or  UDim2.new(0, -20, 0, 0)
+	bubble.Position = startPos
+	TweenService:Create(bubble,
+		TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ Position = isMe and UDim2.new(1, -10, 0, 0) or UDim2.new(0, 10, 0, 0) }
+	):Play()
+
+	scrollToBottom(messagesArea)
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 15. CONTACT BUTTON CREATION
+-- ─────────────────────────────────────────────────────────────────────────────
+
 local function createContactButton(targetPlayer)
-	local btn = Instance.new("TextButton")
-	btn.Name = targetPlayer.Name
-	btn.Size = UDim2.new(1, 0, 0, 70)
-	btn.BackgroundColor3 = Color3.fromRGB(28, 28, 30)
-	btn.BorderSizePixel = 0
-	btn.AutoButtonColor = false
-	btn.Text = ""
-	btn.ZIndex = 52
-	btn.Parent = contactsList
+	local btn               = Instance.new("TextButton")
+	btn.Name                = targetPlayer.Name
+	btn.Size                = UDim2.new(1, 0, 0, 70)
+	btn.BackgroundColor3    = Color3.fromRGB(28, 28, 30)
+	btn.BorderSizePixel     = 0
+	btn.AutoButtonColor     = false
+	btn.Text                = ""
+	btn.ZIndex              = 52
+	btn.Parent              = contactsList
 
-	-- Avatar image frame; at this stage we set a default look and later
-	-- replace Image with the fetched thumbnail.
-	local avatar = Instance.new("ImageLabel")
-	avatar.Size = UDim2.new(0, 50, 0, 50)
-	avatar.Position = UDim2.new(0, 10, 0, 10)
+	-- Hover highlight tween for a tactile feel.
+	btn.MouseEnter:Connect(function()
+		TweenService:Create(btn,
+			TweenInfo.new(0.1, Enum.EasingStyle.Quad),
+			{ BackgroundColor3 = Color3.fromRGB(44, 44, 46) }
+		):Play()
+	end)
+	btn.MouseLeave:Connect(function()
+		TweenService:Create(btn,
+			TweenInfo.new(0.1, Enum.EasingStyle.Quad),
+			{ BackgroundColor3 = Color3.fromRGB(28, 28, 30) }
+		):Play()
+	end)
+
+	-- Avatar ImageLabel with async thumbnail fetch.
+	local avatar            = Instance.new("ImageLabel")
+	avatar.Size             = UDim2.new(0, 50, 0, 50)
+	avatar.Position         = UDim2.new(0, 10, 0, 10)
 	avatar.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
-	avatar.ZIndex = 53
-	avatar.Parent = btn
+	avatar.ZIndex           = 53
+	avatar.Parent           = btn
 
-	-- Thumbnail retrieval is wrapped in pcall to guard against
-	-- transient errors, falling back to a placeholder asset if needed.
 	local ok, img = pcall(function()
 		return Players:GetUserThumbnailAsync(
 			targetPlayer.UserId,
@@ -418,208 +636,286 @@ local function createContactButton(targetPlayer)
 	end)
 	avatar.Image = (ok and img ~= "") and img or "rbxassetid://11263217352"
 
-	local avatarCorner = Instance.new("UICorner")
+	local avatarCorner      = Instance.new("UICorner")
 	avatarCorner.CornerRadius = UDim.new(1, 0)
-	avatarCorner.Parent = avatar
+	avatarCorner.Parent     = avatar
 
-	-- DisplayName is the prominent top text for the contact row.
-	local nameLabel = Instance.new("TextLabel")
-	nameLabel.Size = UDim2.new(1, -150, 0, 25)
-	nameLabel.Position = UDim2.new(0, 70, 0, 10)
+	-- Primary display name label.
+	local nameLabel         = Instance.new("TextLabel")
+	nameLabel.Size          = UDim2.new(1, -150, 0, 25)
+	nameLabel.Position      = UDim2.new(0, 70, 0, 10)
 	nameLabel.BackgroundTransparency = 1
-	nameLabel.Font = Enum.Font.GothamBold
-	nameLabel.TextSize = 16
-	nameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	nameLabel.Font          = Enum.Font.GothamBold
+	nameLabel.TextSize      = 16
+	nameLabel.TextColor3    = Color3.fromRGB(255, 255, 255)
 	nameLabel.TextXAlignment = Enum.TextXAlignment.Left
-	nameLabel.Text = targetPlayer.DisplayName
-	nameLabel.ZIndex = 53
-	nameLabel.Parent = btn
+	nameLabel.Text          = targetPlayer.DisplayName
+	nameLabel.ZIndex        = 53
+	nameLabel.Parent        = btn
 
-	-- Username (with @) is secondary text giving a stable identifier.
-	local usernameLabel = Instance.new("TextLabel")
-	usernameLabel.Size = UDim2.new(1, -150, 0, 20)
-	usernameLabel.Position = UDim2.new(0, 70, 0, 35)
+	-- Secondary @username label for stable identity.
+	local usernameLabel     = Instance.new("TextLabel")
+	usernameLabel.Size      = UDim2.new(1, -80, 0, 20)
+	usernameLabel.Position  = UDim2.new(0, 70, 0, 34)
 	usernameLabel.BackgroundTransparency = 1
-	usernameLabel.Font = Enum.Font.Gotham
-	usernameLabel.TextSize = 13
+	usernameLabel.Font      = Enum.Font.Gotham
+	usernameLabel.TextSize  = 13
 	usernameLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
 	usernameLabel.TextXAlignment = Enum.TextXAlignment.Left
-	usernameLabel.Text = "@" .. targetPlayer.Name
-	usernameLabel.ZIndex = 53
-	usernameLabel.Parent = btn
+	usernameLabel.Text      = "@" .. targetPlayer.Name
+	usernameLabel.ZIndex    = 53
+	usernameLabel.Parent    = btn
 
+	-- Latest-message preview label updated whenever a new message arrives.
+	local previewLabel      = Instance.new("TextLabel")
+	previewLabel.Name       = "PreviewLabel"
+	previewLabel.Size       = UDim2.new(1, -80, 0, 16)
+	previewLabel.Position   = UDim2.new(0, 70, 0, 50)
+	previewLabel.BackgroundTransparency = 1
+	previewLabel.Font       = Enum.Font.Gotham
+	previewLabel.TextSize   = 12
+	previewLabel.TextColor3 = Color3.fromRGB(100, 100, 100)
+	previewLabel.TextXAlignment = Enum.TextXAlignment.Left
+	previewLabel.TextTruncate   = Enum.TextTruncate.AtEnd
+	previewLabel.ZIndex     = 53
+	previewLabel.Parent     = btn
+
+	-- Populate preview with the most recent stored message if any.
+	local latestMsg = history:latest(targetPlayer.Name)
+	if latestMsg then
+		previewLabel.Text = latestMsg.Text
+	end
+
+	-- Open this contact's conversation when the button is tapped.
 	btn.MouseButton1Click:Connect(function()
-		-- Selecting a contact switches the active context for both the
-		-- header label and subsequent outgoing messages.
-		currentChat = targetPlayer
-		contactName.Text = targetPlayer.DisplayName
-
-		-- Swap UI: hide the list and show the actual chat screen.
+		currentChat        = targetPlayer
+		contactName.Text   = targetPlayer.DisplayName
 		contactsList.Visible = false
 		chatScreen.Visible = true
 
-		-- Before replaying history, clear previous message bubbles and
-		-- install a fresh layout so new messages stack from top to bottom.
+		-- Flush and rebuild the messages area from persistent history.
 		messagesArea:ClearAllChildren()
-
 		local layout = Instance.new("UIListLayout")
-		layout.Padding = UDim.new(0, 8)
-		layout.SortOrder = Enum.SortOrder.LayoutOrder
-		layout.Parent = messagesArea
+		layout.Padding     = UDim.new(0, 8)
+		layout.SortOrder   = Enum.SortOrder.LayoutOrder
+		layout.Parent      = messagesArea
 
-		-- Opening a conversation means any unread messages for this
-		-- contact are now "seen", so we drop the notification badge.
+		registry:clearUnread(targetPlayer.Name)
 		setContactNotification(targetPlayer.Name, false)
 
-		-- Hydrate the UI from the chat history so the conversation
-		-- appears as a continuous thread for this contact.
 		for _, storedMsg in ipairs(history:get(targetPlayer.Name)) do
 			createMessageBubble(storedMsg)
 		end
 	end)
 
-	-- Expose this button through the registry for external access
-	-- (e.g., setting unread badges from message events).
 	registry:register(targetPlayer.Name, btn)
-
 	return btn
 end
 
---[[
-	refreshContacts rebuilds the entire contacts list from the live
-	Players service.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 16. CONTACTS LIST REFRESH
+-- ─────────────────────────────────────────────────────────────────────────────
 
-	This is called:
-	- On initial load.
-	- Whenever a player joins.
-	- Whenever a player leaves.
-
-	We clear both the visual list and the registry mapping, then
-	recreate one row per other player.
-]]
 local function refreshContacts()
 	contactsList:ClearAllChildren()
 	registry:reset()
 
-	local layout = Instance.new("UIListLayout")
-	layout.SortOrder = Enum.SortOrder.LayoutOrder
-	layout.Parent = contactsList
+	local layout        = Instance.new("UIListLayout")
+	layout.SortOrder    = Enum.SortOrder.LayoutOrder
+	layout.Parent       = contactsList
 
 	for _, plr in ipairs(Players:GetPlayers()) do
-		-- The local player is not included as a contact for themselves.
 		if plr ~= player then
 			createContactButton(plr)
 		end
 	end
 end
 
--- Keep contacts synchronized with the dynamic player list by calling
--- refreshContacts whenever players join or leave the server.
 Players.PlayerAdded:Connect(refreshContacts)
 Players.PlayerRemoving:Connect(refreshContacts)
 
---[[
-	The send button handler packages the current text into a message
-	payload and forwards it to the server via ChatRemote.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 17. SEND LOGIC
+--     Uses HttpService:GenerateGUID so every message has a unique ID that
+--     the server can use for deduplication / ordering.
+-- ─────────────────────────────────────────────────────────────────────────────
 
-	We enforce three preconditions before sending:
-	1. The remote must exist.
-	2. A currentChat must be selected.
-	3. The input text cannot be empty.
-]]
-sendBtn.MouseButton1Click:Connect(function()
-	if not chatRemote or not currentChat or inputBox.Text == "" then
-		return
-	end
-
-	-- Snapshot the message text once to avoid racing with user edits
-	-- while the event is being fired.
-	local text = inputBox.Text
+local function doSend()
+	if not chatRemote or not currentChat then return end
+	local text = inputBox.Text:match("^%s*(.-)%s*$")   -- trim whitespace
+	if text == "" then return end
 	inputBox.Text = ""
 
-	-- The message packet uses "To" as the target player name and
-	-- "Text" as the raw message body. The server is responsible for
-	-- validating and routing this to the appropriate recipient(s).
+	-- GenerateGUID(false) omits curly braces for a clean 36-char UUID.
+	local msgId = HttpService:GenerateGUID(false)
+
+	sendSound:Play()
+
 	chatRemote:FireServer("SendMessage", {
-		To = currentChat.Name,
-		Text = text,
+		To        = currentChat.Name,
+		Text      = text,
+		MessageId = msgId,
+		Timestamp = os.time(),
 	})
+end
+
+sendBtn.MouseButton1Click:Connect(doSend)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 18. KEYBOARD SHORTCUTS  (UserInputService)
+--     Enter  → send the current message.
+--     Escape → navigate back from the chat view to the contacts list.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	-- gameProcessed is true when the engine already consumed the key
+	-- (e.g. a GUI TextBox absorbed a keystroke), so we skip in that case
+	-- only for Escape; Enter is explicitly gated on inputBox focus instead.
+	if input.KeyCode == Enum.KeyCode.Return then
+		-- Only fire when the InputBox has focus to avoid sending on any Enter press.
+		if UserInputService:GetFocusedTextBox() == inputBox then
+			doSend()
+		end
+	elseif input.KeyCode == Enum.KeyCode.Escape and not gameProcessed then
+		-- Pressing Escape from the chat screen mirrors the Back button.
+		if chatScreen.Visible then
+			chatScreen.Visible    = false
+			contactsList.Visible  = true
+			currentChat           = nil
+		end
+	end
 end)
 
---[[
-	If chatRemote exists, we hook into OnClientEvent to react to
-	server-side broadcasts.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 19. CONTEXT ACTION SERVICE  (mobile back-gesture / button)
+--     Binds a "back" action to the Roblox back button on mobile and the
+--     Backspace key on desktop so the chat can be dismissed without a mouse.
+-- ─────────────────────────────────────────────────────────────────────────────
 
-	The server is expected to fire:
-	- action == "ReceiveMessage" with a `msg` table containing fields:
-	  From (sender name), To (recipient name), Text (body).
+ContextActionService:BindAction(
+	ACTION_BACK,
+	function(_, inputState, _)
+		-- We only care about the Begin state to avoid double-firing.
+		if inputState ~= Enum.UserInputState.Begin then
+			return Enum.ContextActionResult.Pass
+		end
+		if chatScreen.Visible then
+			chatScreen.Visible   = false
+			contactsList.Visible = true
+			currentChat          = nil
+			return Enum.ContextActionResult.Sink   -- consumed
+		end
+		return Enum.ContextActionResult.Pass       -- let others handle it
+	end,
+	false,                                         -- createTouchButton = false
+	Enum.KeyCode.ButtonB,                          -- gamepad B
+	Enum.KeyCode.Backspace                         -- keyboard fallback
+)
 
-	Here we:
-	- Normalize which contact this message belongs to (otherName).
-	- Push it into ChatHistory for that contact.
-	- Either append a bubble to the open chat (if viewing that contact),
-	  or set an unread notification badge (for incoming messages).
-]]
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20. INCOMING MESSAGE HANDLER  (ChatRemote.OnClientEvent)
+-- ─────────────────────────────────────────────────────────────────────────────
+
 if chatRemote then
 	chatRemote.OnClientEvent:Connect(function(action, msg)
-		if action ~= "ReceiveMessage" then
+
+		-- ── Typing indicator ─────────────────────────────────────────────
+		if action == "TypingStarted" then
+			-- Only show the indicator when we are in that contact's chat.
+			if currentChat and msg.From == currentChat.Name then
+				showTypingIndicator(msg.From)
+			end
 			return
 		end
 
-		-- Decide which "other" participant this message relates to from
-		-- the local player's perspective. This ensures our history is
-		-- always keyed by the name of the remote contact.
+		if action == "TypingStopped" then
+			if currentChat and msg.From == currentChat.Name then
+				hideTypingIndicator()
+			end
+			return
+		end
+
+		-- ── Regular message ──────────────────────────────────────────────
+		if action ~= "ReceiveMessage" then return end
+
+		-- Determine the "other" participant from this client's perspective.
 		local otherName
 		if msg.From == player.Name then
 			otherName = msg.To
 		elseif msg.To == player.Name then
 			otherName = msg.From
 		else
-			-- Messages not involving this client are ignored.
-			return
+			return   -- message does not involve this client
 		end
 
-		-- Persist the message to the local history so the thread can be
-		-- reconstructed later even if the user is not in the chat view.
+		-- Stamp with current time if the server did not include a timestamp.
+		if not msg.Timestamp then
+			msg.Timestamp = os.time()
+		end
+
 		history:push(otherName, msg)
 
-		-- If we are currently looking at this contact's chat, we render
-		-- the message immediately into the MessagesArea.
+		-- Update the contact row's preview text, if the button exists.
+		local btn = registry:get(otherName)
+		if btn then
+			local preview = btn:FindFirstChild("PreviewLabel")
+			if preview then
+				preview.Text = msg.Text
+			end
+		end
+
 		if currentChat and otherName == currentChat.Name then
+			-- Conversation is open: render immediately.
 			createMessageBubble(msg)
-		-- Otherwise, if this message is directed at the local player,
-		-- we mark the sender as having unread content.
 		elseif msg.To == player.Name then
-			setContactNotification(msg.From, true)
+			-- Conversation is in the background: badge + sound.
+			registry:incrementUnread(otherName)
+			notifQ:enqueue(otherName)
+			notifySound:Play()
 		end
 	end)
 end
 
---[[
-	The back button in the chat header returns the user to the contacts
-	list, clearing currentChat so subsequent sends are not misrouted.
-]]
-backBtn.MouseButton1Click:Connect(function()
-	chatScreen.Visible = false
-	contactsList.Visible = true
-	currentChat = nil
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 21. NOTIFICATION QUEUE DRAIN  (RunService.Heartbeat)
+--     Rather than touching the DOM for every single incoming message,
+--     we batch-flush the queue once per frame.  This keeps the frame
+--     budget predictable under message bursts.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+RunService.Heartbeat:Connect(function()
+	if notifQ:isEmpty() then return end
+	for _, name in ipairs(notifQ:flush()) do
+		setContactNotification(name, true)
+	end
 end)
 
---[[
-	Some app screens might not have an OpenedEvent pre-created in
-	Studio. To make this robust, we ensure the MessagesAppScreen always
-	exposes one, then we bind it to refreshContacts so each open keeps
-	the list in sync.
-]]
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 22. BACK BUTTON (in-screen)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+backBtn.MouseButton1Click:Connect(function()
+	hideTypingIndicator()
+	chatScreen.Visible   = false
+	contactsList.Visible = true
+	currentChat          = nil
+end)
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 23. MESSAGES APP OPENED EVENT
+-- ─────────────────────────────────────────────────────────────────────────────
+
 local openedEvent = appScreen:FindFirstChild("OpenedEvent")
 if not openedEvent then
-	openedEvent = Instance.new("BindableEvent")
-	openedEvent.Name = "OpenedEvent"
+	openedEvent        = Instance.new("BindableEvent")
+	openedEvent.Name   = "OpenedEvent"
 	openedEvent.Parent = appScreen
 end
 
 openedEvent.Event:Connect(refreshContacts)
 
--- Perform an initial population of the contacts list as soon as the
--- script runs so the user sees all available players immediately.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 24. INITIAL POPULATION
+-- ─────────────────────────────────────────────────────────────────────────────
+
 refreshContacts()
